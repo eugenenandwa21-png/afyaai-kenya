@@ -1,0 +1,147 @@
+rules_version = '2';
+
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    // ── HELPERS ────────────────────────────────────────────────────────────
+
+    // Must be signed in
+    function isAuth() {
+      return request.auth != null;
+    }
+
+    // Get the caller's user document
+    function userDoc() {
+      return get(/databases/$(database)/documents/users/$(request.auth.uid)).data;
+    }
+
+    // Role checks
+    function role() {
+      return userDoc().role;
+    }
+    function isDoctor()      { return isAuth() && role() == 'doctor'; }
+    function isNurse()       { return isAuth() && role() == 'nurse'; }
+    function isAdmin()       { return isAuth() && role() == 'admin'; }
+    function isPharmacist()  { return isAuth() && role() == 'pharmacist'; }
+    function isClinical()    { return isAuth() && role() in ['doctor', 'nurse']; }
+    function isStaff()       { return isAuth() && role() in ['doctor', 'nurse', 'admin', 'pharmacist']; }
+
+    // Facility scoping — caller must belong to same facility as document
+    function sameFacility(docData) {
+      return userDoc().facilityId == docData.facilityId;
+    }
+
+    // Ensure required fields exist on write
+    function hasFields(fields) {
+      return fields.toSet().difference(request.resource.data.keys().toSet()).size() == 0;
+    }
+
+    // Prevent modification of immutable fields after creation
+    function unchanged(field) {
+      return request.resource.data[field] == resource.data[field];
+    }
+
+    // ── USERS ──────────────────────────────────────────────────────────────
+    // Users can read their own profile.
+    // Only admins can create or modify user records.
+    // No one can delete a user document (use Firebase Auth for that).
+    match /users/{uid} {
+      allow read: if isAuth() && (request.auth.uid == uid || isAdmin());
+      allow create: if isAdmin() && hasFields(['email', 'role', 'facilityId']);
+      allow update: if isAdmin()
+        // Admins cannot escalate their own role
+        && !(request.auth.uid == uid && request.resource.data.role != resource.data.role);
+      allow delete: if false;
+    }
+
+    // ── PATIENTS ───────────────────────────────────────────────────────────
+    // All staff at the same facility can read patients.
+    // Clinical staff and admins can create patients.
+    // Clinical staff can update patients (e.g. pregnant flag, allergies).
+    // No one can delete a patient record.
+    match /patients/{patientId} {
+      allow read:   if isStaff() && sameFacility(resource.data);
+      allow create: if isClinical() || isAdmin()
+        && hasFields(['code', 'facilityId', 'createdAt', 'createdBy'])
+        && request.resource.data.createdBy == request.auth.uid;
+      allow update: if (isClinical() || isAdmin()) && sameFacility(resource.data)
+        // patientId, facilityId and createdBy are immutable
+        && unchanged('facilityId')
+        && unchanged('createdBy');
+      allow delete: if false;
+    }
+
+    // ── ENCOUNTERS ─────────────────────────────────────────────────────────
+    // All staff can read encounters for their facility.
+    // Clinical staff can create encounters.
+    // Encounters are immutable after creation — amendments create new records.
+    // Only admins can update (for correction workflow) and only within 24h.
+    match /encounters/{encounterId} {
+      allow read:   if isStaff() && sameFacility(resource.data);
+      allow create: if isClinical()
+        && hasFields(['patientId', 'kind', 'payload', 'summary', 'by', 'at', 'facilityId'])
+        && request.resource.data.by == request.auth.uid
+        && request.resource.data.facilityId == userDoc().facilityId;
+      allow update: if isAdmin() && sameFacility(resource.data)
+        // Only allow amendment within 24 hours of creation
+        && (request.time - resource.data.at) < duration.value(86400, 's')
+        // Cannot change patientId, facilityId or original author
+        && unchanged('patientId')
+        && unchanged('facilityId')
+        && unchanged('by');
+      allow delete: if false;
+    }
+
+    // ── PHARMACY ───────────────────────────────────────────────────────────
+    // All staff can read pharmacy stock (for treatment and billing).
+    // Pharmacists and admins can create/update stock items.
+    // No one can delete a pharmacy record (zero out stock instead).
+    match /pharmacy/{itemId} {
+      allow read:   if isStaff() && sameFacility(resource.data);
+      allow create: if (isPharmacist() || isAdmin())
+        && hasFields(['drugId', 'name', 'stock', 'unit', 'facilityId'])
+        && request.resource.data.facilityId == userDoc().facilityId;
+      allow update: if (isPharmacist() || isAdmin()) && sameFacility(resource.data)
+        && unchanged('facilityId')
+        && unchanged('drugId');
+      allow delete: if false;
+    }
+
+    // ── DISPENSES ──────────────────────────────────────────────────────────
+    // All staff can read dispense records.
+    // Pharmacists and clinical staff can create dispense records.
+    // Dispenses are immutable.
+    match /dispenses/{dispenseId} {
+      allow read:   if isStaff() && sameFacility(resource.data);
+      allow create: if (isPharmacist() || isClinical())
+        && hasFields(['drugId', 'patientId', 'qty', 'at', 'facilityId', 'dispensedBy'])
+        && request.resource.data.dispensedBy == request.auth.uid
+        && request.resource.data.facilityId == userDoc().facilityId
+        // Cannot dispense negative or zero quantity
+        && request.resource.data.qty > 0;
+      allow update: if false;
+      allow delete: if false;
+    }
+
+    // ── AUDIT LOG ──────────────────────────────────────────────────────────
+    // Only admins can read audit logs.
+    // Any authenticated staff member can write to audit log (append-only).
+    // Audit records are immutable.
+    match /audit_log/{logId} {
+      allow read:   if isAdmin() && sameFacility(resource.data);
+      allow create: if isStaff()
+        && hasFields(['action', 'by', 'at', 'facilityId'])
+        && request.resource.data.by == request.auth.uid
+        && request.resource.data.facilityId == userDoc().facilityId;
+      allow update: if false;
+      allow delete: if false;
+    }
+
+    // ── CATCH-ALL ──────────────────────────────────────────────────────────
+    // Deny everything not explicitly allowed above.
+    match /{document=**} {
+      allow read, write: if false;
+    }
+
+  }
+}
